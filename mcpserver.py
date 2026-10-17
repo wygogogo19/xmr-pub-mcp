@@ -1082,7 +1082,7 @@ class Handler(BaseHTTPRequestHandler):
             "_raw_key": key,
         }
 
-    def _send(self, code, obj):
+    def _send(self, code, obj, extra_headers=None):
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -1092,6 +1092,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers",
                          "Content-Type, Mcp-Session-Id, X-API-Key")
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        for k, v in (extra_headers or ()):
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
@@ -1121,7 +1123,29 @@ class Handler(BaseHTTPRequestHandler):
             s["server"] = SERVER_NAME
             s["version"] = SERVER_VERSION
             return self._send(200, s)
-        return self._send(404, {"error": "POST JSON-RPC to /mcp; see https://xmr.pub/#mcp"})
+        # 边缘（nginx `location /mcp { proxy_pass http://mcp/; }`）会剥掉 /mcp 前缀，
+        # 因此这里要同时认 "/mcp" 与上游看到的 ""/"/" 两种形态。
+        if path in ("", "/", "/mcp", "/mcp/"):
+            # MCP Streamable HTTP：本端点不提供 SSE 事件流，规范要求 GET 返回 405 而不是 404
+            # （客户端靠状态码区分「端点不存在」与「端点存在但不支持 GET」）。
+            return self._send(405, {
+                "error": "method_not_allowed",
+                "message": ("This is an MCP Streamable HTTP endpoint. POST JSON-RPC "
+                            "(initialize / tools/list / tools/call) to https://xmr.pub/mcp. "
+                            "No SSE stream is offered on GET."),
+                "endpoint": "https://xmr.pub/mcp",
+                "docs": "https://xmr.pub/#mcp",
+                "source": "https://github.com/wygogogo19/xmr-pub-mcp",
+                "registry": "pub.xmr/xmr-pub-mcp",
+            }, extra_headers=[("Allow", "POST, OPTIONS")])
+        return self._send(404, {"error": "not found", "see": "https://xmr.pub/#mcp"})
+
+    def do_DELETE(self):
+        # 本服务不使用会话 ID，也就没有可终止的会话；按规范允许回 405。
+        self._send(405, {"error": "method_not_allowed",
+                         "message": "This endpoint is stateless: no Mcp-Session-Id is issued, "
+                                    "so there is no session to delete. POST JSON-RPC to /mcp."},
+                   extra_headers=[("Allow", "POST, OPTIONS")])
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
