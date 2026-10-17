@@ -40,8 +40,13 @@ and attaches it to the tool call. On settlement the paying address receives a cr
 
 Accepted assets: USDC on Base (`eip155:8453`) and USDC on Solana. A successful settlement also
 returns an API key bound to that address, so follow-up calls can be made with `X-API-Key` instead of
-re-signing on every request. There is no subscription, no account, no email and no separately sold
-API key: credits are bought by paying, not by registering.
+re-signing on every request. That key is shown **once**, in the machine-readable
+`structuredContent`; the human/LLM-facing text block only carries its prefix, and the key is never
+logged. There is no subscription, no account, no email and no separately sold API key: credits are
+bought by paying, not by registering.
+
+Malformed arguments are rejected **before** any credit is spent: call the tool with the wrong shape
+and you get `invalid_arguments` naming the missing or invalid field, with your balance untouched.
 
 An unpaid call to a metered tool returns a standard MCP *payment required* result carrying the
 `accepts[]` list — a client can read the price list from the error itself.

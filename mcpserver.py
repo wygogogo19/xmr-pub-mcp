@@ -71,6 +71,14 @@ try:
 except Exception:                      # 缺 x402_pay.py 时其余工具照常工作
     x402_pay = None
 
+# 2026-10-17 修复：账本表此前从未创建（init() 没被调用），任何带付款的请求都在 _seen() 处
+# 抛 sqlite3.OperationalError: no such table → 进程未回包 → Cloudflare 502。启动时幂等建表。
+if x402_pay is not None:
+    try:
+        x402_pay.init()
+    except Exception as _exc:          # noqa: BLE001
+        print("x402 ledger init failed: %s" % _exc, flush=True)
+
 # 付费工具：对账 / 报表 / 测算这一类「商户与矿工真正要买」的工具。
 # 节点状态、费率、内存池三个遥测工具保持免费——它们是发现层（Registry / 目录里被搜到的入口）。
 PAID_TOOLS = ("xmr_verify_tx_proof", "xmr_verify_payment",
@@ -80,17 +88,47 @@ def _x402_enabled():
     return x402_pay is not None and bool(x402_pay.enabled())
 
 def _payment_required(tool, reason, mid):
-    """按 MCP 传输规范返回 PaymentRequired（structuredContent + 人类可读说明）。"""
+    """按 MCP 传输规范返回 PaymentRequired（structuredContent + 人类可读说明）。
+    共享模块的文案是第三方品牌，这里整体重写成 xmr.pub 自己的措辞（含 content[0] 同步）。"""
     out = x402_pay.payment_required(tool, reason)
-    # 品牌：复用共享模块会写成 "RobotBase …"，这里覆盖成 xmr.pub 自己的措辞
-    res = out.get("structuredContent", {}).get("resource")
+    obj = out.get("structuredContent") or {}
+    res = obj.get("resource")
     if isinstance(res, dict):
-        res["description"] = "xmr.pub Monero read tool: %s" % tool
+        res["url"] = "https://xmr.pub/mcp#%s" % tool
+        res["description"] = "xmr.pub Monero read-only tool: %s" % tool
+    c = x402_pay.cfg()
+    dec = 10 ** int(c.get("decimals", 6))
+    packs = [{"amount": p["amount_atomic"], "usdc": int(p["amount_atomic"]) / dec,
+              "calls": int(p["calls"])} for p in x402_pay.packs()]
+    nets = [{"network": o["network"], "asset": o["asset"], "payTo": o["pay_to"],
+             "label": o.get("label", "")} for o in x402_pay.options()]
+    obj["extensions"] = {"xmr.pub": {
+        "pricing": "credit packs: " + "; ".join("%g USDC = %d calls" % (p["usdc"], p["calls"]) for p in packs),
+        "packs": packs, "networks": nets,
+        "facilitator": {"mode": "self-hosted",
+                        "note": "Settlement is performed by xmr.pub server-side via its own x402 facilitator "
+                                "(verify then settle); payers only send the signed payload."},
+        "paidTools": list(PAID_TOOLS),
+        "discovery": "https://xmr.pub/.well-known/x402",
+        "docs": "https://xmr.pub/llms.txt",
+    }}
+    human = (
+        "%s\n\n%s is a paid xmr.pub tool. Buy an x402 credit pack (%s) in USDC on %s, then retry this "
+        "same call with the payment payload in params._meta[\"x402/payment\"]. Full requirements are in "
+        "structuredContent.accepts[]. A successful payment returns an API key (X-API-Key header) for the "
+        "remaining credits. Free tools: xmr_node_status, xmr_fee_oracle, xmr_mempool_health."
+        % (obj.get("error", "payment required"), tool,
+           ", ".join("%g USDC = %d calls" % (p["usdc"], p["calls"]) for p in packs),
+           " / ".join("%s (payTo %s)" % (n["label"] or n["network"], n["payTo"]) for n in nets)))
+    out["content"] = [{"type": "text", "text": json.dumps(obj, ensure_ascii=False)},
+                      {"type": "text", "text": human}]
+    out["structuredContent"] = obj
     return {"jsonrpc": "2.0", "id": mid, "result": out}
 
 SERVER_NAME = "xmr.pub"
 SERVER_VERSION = "2.0.0"
-PROTOCOL_VERSION = "2024-11-05"
+PROTOCOL_VERSION = "2025-06-18"              # 最新支持版本；客户端请求受支持版本时原样回显
+SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 XMR_ADDR_RE = re.compile(r"^[48][1-9A-HJ-NP-Za-km-z]{94}$")
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -964,7 +1002,94 @@ TOOLS = [
 TOOL_BY_NAME = {t["name"]: t for t in TOOLS}
 
 
+# ================= 参数预检（在扣费之前） =================
+def _p_addr(v):
+    return isinstance(v, str) and bool(XMR_ADDR_RE.match(v.strip()))
+
+
+def _p_hex64(v):
+    return isinstance(v, str) and bool(HEX64_RE.match(v.strip()))
+
+
+def precheck(name, args):
+    """扣信用之前做纯参数校验：客户端参数错误不该扣额度，也不该占用钱包通道。
+
+    只校验「必填 + 格式」，与各工具自身的同名校验保持一致；返回错误串 = 应拒付执行，
+    None = 放行（链上/钱包层面的校验仍在工具内部做）。
+    """
+    a = args if isinstance(args, dict) else {}
+    if name == "xmr_verify_tx_proof":
+        for k in ("txid", "address", "tx_key", "view_key"):
+            if not str(a.get(k) or "").strip():
+                return "缺少参数 %s" % k
+        if not _p_hex64(a.get("txid")):
+            return "txid 必须是 64 位十六进制"
+        if not _p_hex64(a.get("tx_key")):
+            return "tx_key 必须是 64 位十六进制"
+        if not _p_hex64(a.get("view_key")):
+            return "view_key 必须是 64 位十六进制"
+        if not _p_addr(a.get("address")):
+            return "address 不是合法的门罗主网地址"
+    elif name == "xmr_verify_payment":
+        if not _p_addr(a.get("address")):
+            return "address 不是合法的门罗主网地址"
+        if not _p_hex64(a.get("view_key")):
+            return "view_key 必须是 64 位十六进制（只读密钥，无法转账）"
+        pays = a.get("payments")
+        if pays is None:
+            if not _p_hex64(a.get("txid")):
+                return "需要 payments 数组，或提供 txid/tx_key 单笔参数"
+            if not _p_hex64(a.get("tx_key")):
+                return "tx_key 必须是 64 位十六进制（付款方出示的 tx proof）"
+        else:
+            if not isinstance(pays, list) or not pays:
+                return "payments 必须是非空数组"
+            if len(pays) > 100:
+                return "单次最多核验 100 笔（更多请分批或用 xmr_merchant_report）"
+            for i, p in enumerate(pays, 1):
+                if not isinstance(p, dict):
+                    return "第 %d 笔格式不对" % i
+                if not _p_hex64(p.get("txid")):
+                    return "第 %d 笔的 txid 不是 64 位十六进制" % i
+                if not _p_hex64(p.get("tx_key")):
+                    return "第 %d 笔的 tx_key 不是 64 位十六进制（付款方出示的 tx proof）" % i
+    elif name == "xmr_merchant_report":
+        if not _p_addr(a.get("address")):
+            return "address 不是合法的门罗主网地址"
+        if not _p_hex64(a.get("view_key")):
+            return "view_key 必须是 64 位十六进制（只读密钥，无法转账）"
+        try:
+            days = int(a.get("period_days", 7))
+        except (TypeError, ValueError):
+            return "period_days 必须是整数"
+        if not 1 <= days <= 30:
+            return "period_days 必须在 1–30 之间"
+    elif name == "xmr_mining_profitability":
+        raw = a.get("hashrate_hs")
+        try:
+            if raw in (None, ""):
+                if a.get("hashrate_khs") not in (None, ""):
+                    raw = float(a["hashrate_khs"]) * 1000.0
+                elif a.get("hashrate_mhs") not in (None, ""):
+                    raw = float(a["hashrate_mhs"]) * 1e6
+            hs = float(raw) if raw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            return "hashrate 必须是数字"
+        if hs <= 0:
+            return "需要 hashrate_hs（或 hashrate_khs / hashrate_mhs），单位 H/s，且必须大于 0"
+    return None
+
+
 # ================= MCP / HTTP 层 =================
+def _x402_networks_text():
+    try:
+        if _x402_enabled():
+            return ", ".join(o.get("label") or o["network"] for o in x402_pay.options())
+    except Exception:  # noqa: BLE001
+        pass
+    return "Base USDC"
+
+
 def mcp_handle(msg, ctx=None):
     """处理一条 JSON-RPC 消息；通知类返回 None。ctx 携带计量上下文（不含任何工具参数）。"""
     method = msg.get("method")
@@ -972,17 +1097,20 @@ def mcp_handle(msg, ctx=None):
     if mid is None:            # 通知，不需要回复
         return None
     if method == "initialize":
+        want = ((msg.get("params") or {}).get("protocolVersion") or "")
         return {"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": want if want in SUPPORTED_PROTOCOLS else PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            "instructions": ("xmr.pub 提供的门罗只读工具集（7 个）：节点状态、动态费率、内存池健康度、"
-                             "零私钥 tx-proof 单笔对账；以及数据产品层的 xmr_verify_payment（批量到账核验）、"
-                             "xmr_merchant_report（收款流水）、"
-                             "xmr_mining_profitability（收益测算，仅用链上网络口径）。"
-                             "本站不运行任何矿池，因此没有任何池/Stratum 相关工具。"
-                             "所有工具均为只读、无需私钥托管、不广播交易。当前数据产品层免费开放，"
-                             "仅按匿名/带 key 的额度限速；用量只统计工具名与成败，不记录参数。"),
+            "instructions": (
+                "xmr.pub: read-only Monero MCP toolkit (7 tools; no custody, never signs or broadcasts). "
+                "FREE, no auth: xmr_node_status, xmr_fee_oracle, xmr_mempool_health. "
+                "PAID (x402 credit packs, USDC): xmr_verify_tx_proof, xmr_verify_payment, "
+                "xmr_merchant_report, xmr_mining_profitability — 1 USDC = 100 calls or 0.1 USDC = 10 calls "
+                "(" + _x402_networks_text() + "). Call a paid tool without payment to get the x402 "
+                "PaymentRequired (accepts[]); retry with params._meta[\"x402/payment\"]. A settled payment "
+                "returns an API key (X-API-Key) for the remaining credits. Arguments are never logged. "
+                "免费：节点状态/费率/内存池；付费（x402 信用包）：tx-proof 对账、批量到账核验、收款流水、挖矿收益测算。"),
         }}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
@@ -998,25 +1126,61 @@ def mcp_handle(msg, ctx=None):
             return {"jsonrpc": "2.0", "id": mid,
                     "error": {"code": -32602, "message": "unknown tool: %s" % name}}
 
+        # ---- 参数预检：参数错误直接拒，不扣额度、不进钱包 ----
+        arg_err = precheck(name, params.get("arguments") or {})
+        if arg_err:
+            body = {"error": "invalid_arguments", "detail": arg_err}
+            return {"jsonrpc": "2.0", "id": mid, "result": {
+                "content": [{"type": "text", "text": json.dumps(body, ensure_ascii=False)}],
+                "isError": True,
+                "structuredContent": body,
+            }}
+
         # ---- x402 门禁：仅付费工具；先结算/扣信用，再执行 ----
-        # 顺序刻意如此：付款成功但工具本身失败 = 客户买的是额度、不退。
+        # 顺序刻意如此：参数已预检通过；付款成功但执行失败 = 客户买的是额度、不退。
         x402_info = None
         if name in PAID_TOOLS and _x402_enabled():
             pay = ((params.get("_meta") or {}) or {}).get("x402/payment")
             raw_key = (ctx or {}).get("_raw_key") or ""
             if pay:
-                res = x402_pay.try_pay(name, pay)
+                if not isinstance(pay, dict):
+                    return _payment_required(name, "x402 payment rejected: invalid_payload "
+                                                   "(x402/payment must be an object)", mid)
+                try:
+                    res = x402_pay.try_pay(name, pay)
+                except Exception as exc:  # noqa: BLE001  任何内部异常都回干净的 x402 错误，不再让进程掉包
+                    print("x402 try_pay error: %r" % exc, flush=True)
+                    res = {"ok": False, "reason": "server_error (%s)" % type(exc).__name__}
+                if res.get("pending"):
+                    # 已广播、未确认：绝不让客户重签（会重复扣款）。原样重发同一载荷即可拿到结果。
+                    return {"jsonrpc": "2.0", "id": mid, "result": {
+                        "isError": True,
+                        "_meta": {"x402/payment-response": {"success": False, "errorReason": "settlement_pending",
+                                                            "transaction": res.get("tx", ""),
+                                                            "network": (pay.get("accepted") or {}).get("network", ""),
+                                                            "payer": res.get("payer", "")}},
+                        "structuredContent": {"x402Version": 2, "error": "settlement_pending",
+                                              "transaction": res.get("tx", ""), "retryable": True,
+                                              "action": "Do NOT sign a new payment. Resend this exact same request "
+                                                        "(same x402/payment payload) in ~10 seconds."},
+                        "content": [{"type": "text", "text": "Payment broadcast (tx %s) but not confirmed yet. Do NOT "
+                                     "re-sign; resend the same request with the same payload in ~10s to receive "
+                                     "credits and the tool result." % res.get("tx", "")}]}}
                 if not res.get("ok"):
                     return _payment_required(
                         name, "x402 payment rejected: %s. Re-read accepts[] and sign a fresh "
-                              "EIP-3009 authorization." % res.get("reason"), mid)
+                              "payment payload." % res.get("reason"), mid)
                 left = x402_pay.spend(res["payer"], name)
                 if left < 0:
                     return _payment_required(
                         name, "payer %s has no remaining credit; buy another pack." % res["payer"], mid)
-                x402_info = {"payer": res["payer"], "credit_remaining": left,
+                x402_info = {"payer": res["payer"], "credit_remaining": left, "creditRemaining": left,
                              "settled_tx": res.get("tx", ""), "api_key": res.get("key"),
-                             "network": (x402_pay.cfg().get("network") or "")}
+                             "network": ((pay.get("accepted") or {}).get("network")
+                                         or x402_pay.cfg().get("network") or "")}
+                if res.get("key"):
+                    # key 只在签发它的那一次回执里出现一次；给个前缀方便对账
+                    x402_info["api_key_prefix"] = res["key"][:12]
             elif raw_key:
                 ent = x402_pay.lookup_key(raw_key)
                 if not ent:
@@ -1025,8 +1189,8 @@ def mcp_handle(msg, ctx=None):
                 if left < 0:
                     return _payment_required(
                         name, "x402 key for %s has no remaining credit" % ent["payer"], mid)
-                x402_info = {"payer": ent["payer"], "credit_remaining": left,
-                             "network": ent.get("network", "")}
+                x402_info = {"payer": ent["payer"], "credit_remaining": left, "creditRemaining": left,
+                             "network": ent.get("network", ""), "auth": "api_key"}
             else:
                 return _payment_required(name, "payment required", mid)
 
@@ -1048,8 +1212,17 @@ def mcp_handle(msg, ctx=None):
         }
         if x402_info:                     # 结算回执：本次扣了几次信用、链上 tx、签发的 key
             result["structuredContent"] = {"_x402": x402_info}
+            # 付款结算与 API key 两条路径都回 payment-response（key 路径没有新交易，transaction 为空）
+            result["_meta"] = {"x402/payment-response": {
+                "success": True, "transaction": x402_info.get("settled_tx", "") or "",
+                "network": x402_info.get("network", ""), "payer": x402_info.get("payer", ""),
+                "creditRemaining": x402_info.get("credit_remaining"),
+                "credit_remaining": x402_info.get("credit_remaining"),
+                "auth": x402_info.get("auth", "x402_payment"),
+                **({"apiKey": x402_info["api_key"]} if x402_info.get("api_key") else {})}}
             if isinstance(data, dict):
-                data["_x402"] = x402_info
+                # 面向 LLM/日志的文本块绝不放明文 key：只留前缀；明文只走 structuredContent
+                data["_x402"] = {k: v for k, v in x402_info.items() if k != "api_key"}
                 result["content"] = [{"type": "text",
                                       "text": json.dumps(data, ensure_ascii=False, indent=2)}]
         return {"jsonrpc": "2.0", "id": mid, "result": result}
@@ -1147,6 +1320,18 @@ class Handler(BaseHTTPRequestHandler):
                                     "so there is no session to delete. POST JSON-RPC to /mcp."},
                    extra_headers=[("Allow", "POST, OPTIONS")])
 
+    @staticmethod
+    def _safe_handle(m, ctx):
+        """任何未捕获异常都回 JSON-RPC -32603，而不是让连接断掉（边缘会把断连变成 502）。"""
+        try:
+            if not isinstance(m, dict):
+                return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+            return mcp_handle(m, ctx)
+        except Exception as exc:  # noqa: BLE001
+            print("mcp_handle error: %r" % exc, flush=True)
+            return {"jsonrpc": "2.0", "id": m.get("id") if isinstance(m, dict) else None,
+                    "error": {"code": -32603, "message": "internal error"}}
+
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path not in ("/", "/mcp"):
@@ -1178,9 +1363,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"jsonrpc": "2.0", "id": None,
                                     "error": {"code": -32700, "message": "parse error"}})
         if isinstance(msg, list):                        # 批量
-            out = [r for r in (mcp_handle(m, ctx) for m in msg) if r is not None]
+            out = [r for r in (self._safe_handle(m, ctx) for m in msg) if r is not None]
             return self._send(200 if out else 202, out if out else {})
-        resp = mcp_handle(msg, ctx)
+        resp = self._safe_handle(msg, ctx)
         if resp is None:
             self.send_response(202)
             self.send_header("Content-Length", "0")
