@@ -104,8 +104,50 @@ single path `/mcp`. `GET /mcp` without a JSON-RPC body returns a 404 with a poin
 
 ## Self-hosting
 
-`mcpserver.py` is dependency-free — standard library only, Python 3.9+. Copy it next to your nodes
-and set the environment variables (see [`examples/env.example`](./examples/env.example)):
+`mcpserver.py` is dependency-free — standard library only, Python 3.9+. It talks to nodes **you**
+run; nothing in it is hard-wired to xmr.pub's hosts, and every endpoint is an environment variable
+(see [`examples/env.example`](./examples/env.example)). The examples below use the port numbers of
+our own deployment, so map them onto yours (table further down).
+
+### 1. Point it at your own `monerod`
+
+Only a restricted-RPC `monerod` is required, and it has to be reachable over plain HTTP **without
+RPC login**: this client sends credentials to the wallet RPC (HTTP digest) but not to the node. Keep
+the node bound to localhost, or firewall it.
+
+```bash
+# on the node host: restricted RPC on 18089, bound to loopback
+# (--rpc-restricted-bind-ip already defaults to 127.0.0.1, so no extra flag is needed)
+monerod --rpc-restricted-bind-port 18089
+```
+
+If the node and this server are not on the same host — that is our case, the MCP runs in a container
+on another machine — the node must listen on an interface the MCP host can reach:
+
+```bash
+monerod --rpc-restricted-bind-ip 0.0.0.0 --rpc-restricted-bind-port 18089 --confirm-external-bind
+# then firewall 18089 so only the MCP host can reach it, and set MONEROD_RPC to that address
+```
+
+A node bound that way is *not* reachable at `127.0.0.1` anymore, so `MONEROD_RPC` has to name the
+address you actually bound. Also note `--rpc-restricted-bind-port` has no built-in default: leave it
+out and monerod serves the restricted RPC on the main RPC port (`18081` mainnet) instead.
+
+Preflight it before starting the server — this one line catches every port or bind mismatch:
+
+```bash
+curl -s -m 10 -X POST http://127.0.0.1:18089/json_rpc \
+  -d '{"jsonrpc":"2.0","id":"0","method":"get_info"}' | head -c 200
+# expect JSON with "height" / "synchronized"; "Connection refused" means MONEROD_RPC is wrong
+```
+
+| Value in our examples | Whose convention | What to use on your own box |
+| --- | --- | --- |
+| node RPC `127.0.0.1:18089` | community convention for the **restricted** RPC port | `monerod`'s built-in default is to serve the restricted RPC on the *main* RPC port (`18081` mainnet / `28081` testnet / `38081` stagenet). Set `MONEROD_RPC` to whatever you actually bound. |
+| wallet RPC | **ours: `18084`** | `monero-wallet-rpc` defaults to `18083` on mainnet, which is what §3's example uses — set `WALLET_RPC_PORT` to yours. |
+| helper `127.0.0.1:18085/rpc` | **ours** | You supply your own, or omit it entirely. |
+
+### 2. Endpoints and knobs
 
 | Variable | Purpose |
 | --- | --- |
@@ -118,23 +160,67 @@ and set the environment variables (see [`examples/env.example`](./examples/env.e
 | `ANON_RATE_PER_MIN` / `KEY_RATE_PER_MIN` | Rate ceilings. |
 | `RB_X402_CONFIG` | Optional config for the `x402_pay` module. When that module is missing the paid tools return a payment-required result instead of running; the free tools are unaffected. |
 
+### 3. Run it
+
+Free tools only — that is all you need for node status, fees and mempool health:
+
 ```bash
 MONEROD_RPC=http://127.0.0.1:18089 python3 mcpserver.py
 ```
 
-Or build the reference container:
+Add the optional upstreams: the three verification tools need a read-only `monero-wallet-rpc`, and
+`xmr_mempool_health` gives fuller output with a helper that exposes `get_transaction_pool`:
+
+```bash
+MONEROD_RPC=http://127.0.0.1:18089 \
+XMR_HELPER_RPC=http://127.0.0.1:18085/rpc \
+WALLET_RPC_HOST=127.0.0.1 WALLET_RPC_PORT=18083 \
+WALLET_RPC_USER=myuser WALLET_RPC_PASS=mypass \
+python3 mcpserver.py
+```
+
+Missing pieces degrade instead of crashing: without `WALLET_RPC_*` the startup log says
+`wallet_rpc=off` and only the view-key tools fail; without `XMR_HELPER_RPC` only
+`xmr_mempool_health` falls back and reports `pool_source: unavailable`.
+
+### 4. Or use the reference container
 
 ```bash
 docker build -t xmr-pub-mcp .
-docker run --rm -p 8080:8080 -v /srv/xmrpub/data:/data \
+
+# A) node on the same host, bound to loopback (the §1 default): share the host network
+docker run --rm --network host -v "$PWD/data:/data" \
+  -e MONEROD_RPC=http://127.0.0.1:18089 xmr-pub-mcp
+
+# B) node elsewhere on your LAN: publish the port and name the node's address
+#    (replace 10.0.0.5 with your own node host — this is a placeholder)
+docker run --rm -p 8080:8080 -v "$PWD/data:/data" \
   -e MONEROD_RPC=http://10.0.0.5:18089 xmr-pub-mcp
 ```
+
+Three things bite people here. Inside the container `127.0.0.1` is *the container*, not your host —
+which is exactly why variant A needs `--network host`. A loopback-bound node is **not** reachable
+through the docker bridge (`host.docker.internal` included), so for variant B the node has to be
+bound to a reachable interface as shown in §1. And the `-v` path must be a directory you own
+(`$PWD/data`), because `/data` holds `usage.db`.
+
+### 5. Before you expose it
+
+The verification tools accept your **view key in the request body**, so put this behind TLS
+(Cloudflare Tunnel, nginx, Caddy, …) and never expose plain HTTP to the internet. The free telemetry
+tools are unauthenticated by design and rate limited per IP; there is no admin surface and no
+endpoint that can move funds.
+
+Metering is not part of this repository: `x402_pay.py` is intentionally omitted, so on a self-hosted
+instance the four metered tools answer with a payment-required result instead of running. The hosted
+instance at `https://xmr.pub/mcp` is the one that settles x402 payments.
 
 ### 中文速览
 
 只读门罗工具集，7 个工具：节点状态 / 动态费率 / 内存池健康度 免费，交易与到账核验、收款流水、收益测算走 x402
 信用包计费（1 USDC = 100 次）。服务端不托管资产、不广播交易、不记录任何工具参数；需要 view key 的工具用一次性只读钱包在
-内存盘里完成校验并即时销毁。本站不运行矿池，因此没有任何池相关工具。
+内存盘里完成校验并即时销毁。本站不运行矿池，因此没有任何池相关工具。自托管只需自备一个受限 RPC 的 `monerod`（可选
+再加 `monero-wallet-rpc`），端口与地址全部通过环境变量指定，不写死；对外暴露前务必套 TLS，因为 view key 在请求体里传输。
 
 ## License
 
