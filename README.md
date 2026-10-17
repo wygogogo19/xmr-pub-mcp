@@ -100,7 +100,9 @@ Stated plainly, because these are the things a merchant or an agent builder will
 ```
 
 The endpoint speaks JSON-RPC over HTTP (`initialize`, `ping`, `tools/list`, `tools/call`) at the
-single path `/mcp`. `GET /mcp` without a JSON-RPC body returns a 404 with a pointer to the endpoint.
+single path `/mcp`. There is no SSE stream, so `GET /mcp` answers **405 Method Not Allowed** with
+`Allow: POST, OPTIONS` and a body that points at the endpoint, the site docs and this repository —
+which is what the Streamable HTTP transport expects instead of a 404. Unknown paths still 404.
 
 ## Self-hosting
 
