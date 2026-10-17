@@ -126,7 +126,7 @@ def _payment_required(tool, reason, mid):
     return {"jsonrpc": "2.0", "id": mid, "result": out}
 
 SERVER_NAME = "xmr.pub"
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = "2.1.0"
 PROTOCOL_VERSION = "2025-06-18"              # 最新支持版本；客户端请求受支持版本时原样回显
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
